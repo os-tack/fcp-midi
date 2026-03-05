@@ -66,6 +66,7 @@ mcp = create_fcp_server(
     adapter=adapter,
     verbs=VERBS,
     extra_sections=_EXTRA_SECTIONS,
+    extensions=["mid", "midi"],
     name="midi-fcp",
     instructions="MIDI File Context Protocol. Call midi_help for the reference card.",
 )

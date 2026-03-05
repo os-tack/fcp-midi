@@ -1,7 +1,7 @@
 {
   "name": "fcp-midi",
   "description": "Semantic MIDI music composition",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "license": "MIT",
   "author": {
     "name": "Scott Meyer"
