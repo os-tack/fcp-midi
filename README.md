@@ -4,7 +4,7 @@ MCP server for semantic MIDI composition.
 
 ## What It Does
 
-fcp-midi lets LLMs compose music by describing musical intent -- notes, chords, dynamics, tempo changes -- and renders it into standard MIDI files. Instead of manipulating raw bytes or MIDI events, the LLM works with operations like `note Bass E2 at:1.1 dur:quarter vel:90` and `crescendo @track:Lead vel:45-75 @range:3.1-6.4`. Built on the [FCP](https://github.com/aetherwing-io/fcp) framework, powered by pretty-midi for serialization.
+fcp-midi lets LLMs compose music by describing musical intent -- notes, chords, dynamics, tempo changes -- and renders it into standard MIDI files. Instead of manipulating raw bytes or MIDI events, the LLM works with operations like `note Bass E2 at:1.1 dur:quarter vel:90` and `crescendo @track:Lead vel:45-75 @range:3.1-6.4`. Built on the [FCP](https://github.com/os-tack/fcp) framework, powered by pretty-midi for serialization.
 
 ## Quick Example
 

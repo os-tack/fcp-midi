@@ -6,6 +6,6 @@
   "author": {
     "name": "Scott Meyer"
   },
-  "repository": "https://github.com/aetherwing-io/fcp-midi",
+  "repository": "https://github.com/os-tack/fcp-midi",
   "keywords": ["midi", "music", "composition", "mcp"]
 }
