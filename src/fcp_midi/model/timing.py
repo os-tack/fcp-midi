@@ -6,7 +6,7 @@ from the Song model.
 
 from __future__ import annotations
 
-from fcp_midi.model.song import TempoChange, TimeSignature
+from fcp_midi.model.types import TempoChange, TimeSignature
 
 
 # ---------------------------------------------------------------------------

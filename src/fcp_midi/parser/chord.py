@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 
 from fcp_midi.errors import ValidationError
-from fcp_midi.model.song import Pitch
+from fcp_midi.model.types import Pitch
 from fcp_midi.parser.pitch import _NOTE_OFFSETS, _MIDI_TO_NOTE
 
 # Chord quality → list of semitone intervals from root

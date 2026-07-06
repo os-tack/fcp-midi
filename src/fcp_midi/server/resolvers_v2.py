@@ -4,16 +4,156 @@ Replaces the simplified _resolve_selectors_v2 from ops_editing_v2.py with
 proper NoteIndex-powered resolution. Supports all selector types:
   @track:NAME, @pitch:P, @range:M.B-M.B, @channel:N,
   @velocity:LO-HI, @all, @recent:N, and negation via @not:type:value.
+
+Also houses the instrument/bank/velocity resolution helpers, which are
+shared parameter-parsing utilities with no dependency on either model
+generation (v1 Song or v2 MidiModel).
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+from fcp_midi.lib.gm_instruments import instrument_to_program, program_to_instrument
+from fcp_midi.lib.instrument_registry import InstrumentRegistry
+from fcp_midi.lib.velocity_names import parse_velocity
 from fcp_midi.model.midi_model import NoteIndex, NoteRef
 from fcp_midi.parser.pitch import parse_pitch
 from fcp_midi.parser.position import parse_position, _ticks_per_beat
 from fcp_midi.parser.selector import Selector
 from fcp_midi.server.formatter import format_result
 from fcp_midi.server.ops_context_v2 import MidiOpContext, get_time_sigs
+
+
+@dataclass
+class InstrumentResolution:
+    """Result of resolving an instrument from op params."""
+    program: int | None
+    instrument_name: str | None
+    bank_msb: int | None
+    bank_lsb: int | None
+    is_drum_kit: bool = False
+
+
+def resolve_bank(params: dict[str, str]) -> tuple[int | None, int | None] | str:
+    """Parse ``bank:MSB[.LSB]`` param. Returns (msb, lsb) tuple or error string."""
+    bank_str = params.get("bank")
+    if not bank_str:
+        return (None, None)
+    try:
+        parts = bank_str.split(".")
+        bank_msb = int(parts[0])
+        if not (0 <= bank_msb <= 127):
+            return format_result(False, "Bank MSB must be 0-127")
+        bank_lsb = None
+        if len(parts) > 1:
+            bank_lsb = int(parts[1])
+            if not (0 <= bank_lsb <= 127):
+                return format_result(False, "Bank LSB must be 0-127")
+        return (bank_msb, bank_lsb)
+    except ValueError:
+        return format_result(False, f"Invalid bank value: {bank_str!r}")
+
+
+_DRUM_NAMES = frozenset({"standard-kit", "drum-kit", "drums", "percussion"})
+
+
+def resolve_instrument(
+    params: dict[str, str],
+    instrument_registry: InstrumentRegistry | None,
+    bank_msb: int | None = None,
+    bank_lsb: int | None = None,
+) -> InstrumentResolution | str:
+    """Resolve instrument from op params (program:N or instrument name).
+
+    Returns InstrumentResolution or error string.
+    """
+    inst_name = params.get("instrument")
+    raw_program = params.get("program")
+
+    if raw_program is not None:
+        try:
+            program = int(raw_program)
+            if not (0 <= program <= 127):
+                return format_result(False, "Program must be 0-127")
+        except ValueError:
+            return format_result(False, f"Invalid program number: {raw_program!r}")
+        # Reverse lookup for display name
+        if inst_name is None:
+            inst_name = program_to_instrument(program)
+        return InstrumentResolution(
+            program=program,
+            instrument_name=inst_name,
+            bank_msb=bank_msb,
+            bank_lsb=bank_lsb,
+        )
+
+    if not inst_name:
+        return InstrumentResolution(
+            program=None,
+            instrument_name=None,
+            bank_msb=bank_msb,
+            bank_lsb=bank_lsb,
+        )
+
+    normalized = inst_name.strip().lower().replace(" ", "-")
+    is_drum_kit = normalized in _DRUM_NAMES
+
+    if instrument_registry is not None:
+        spec = instrument_registry.resolve(inst_name)
+        if spec is not None:
+            resolved_bank_msb = bank_msb
+            resolved_bank_lsb = bank_lsb
+            if resolved_bank_msb is None and spec.bank_msb != 0:
+                resolved_bank_msb = spec.bank_msb
+            if resolved_bank_lsb is None and spec.bank_lsb != 0:
+                resolved_bank_lsb = spec.bank_lsb
+            return InstrumentResolution(
+                program=spec.program,
+                instrument_name=inst_name,
+                bank_msb=resolved_bank_msb,
+                bank_lsb=resolved_bank_lsb,
+                is_drum_kit=is_drum_kit,
+            )
+        elif not is_drum_kit:
+            suggestion = instrument_registry.suggest(inst_name)
+            msg = f"Unknown instrument: {inst_name!r}"
+            if suggestion:
+                msg += f"\n  {suggestion}"
+            return format_result(False, msg)
+    else:
+        program = instrument_to_program(inst_name)
+        if program is None and not is_drum_kit:
+            return format_result(False, f"Unknown instrument: {inst_name!r}")
+        return InstrumentResolution(
+            program=program,
+            instrument_name=inst_name,
+            bank_msb=bank_msb,
+            bank_lsb=bank_lsb,
+            is_drum_kit=is_drum_kit,
+        )
+
+    # Drum kit fallback
+    return InstrumentResolution(
+        program=0,
+        instrument_name=inst_name,
+        bank_msb=bank_msb,
+        bank_lsb=bank_lsb,
+        is_drum_kit=True,
+    )
+
+
+def resolve_velocity(
+    params: dict[str, str],
+    key: str = "vel",
+    default: str = "80",
+) -> int | str:
+    """Parse a velocity param, returning 1-127 or error string."""
+    vel_str = params.get(key, default)
+    try:
+        return parse_velocity(vel_str)
+    except ValueError as e:
+        return format_result(False, f"Invalid velocity: {e}")
 
 
 def resolve_notes_v2(

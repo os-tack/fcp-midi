@@ -1,6 +1,6 @@
 """Tests for timing conversions: position <-> ticks <-> seconds."""
 
-from fcp_midi.model.song import TempoChange, TimeSignature
+from fcp_midi.model.types import TempoChange, TimeSignature
 from fcp_midi.model.timing import (
     position_to_ticks,
     seconds_to_ticks,

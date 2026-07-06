@@ -49,7 +49,7 @@ def dispatch_query_v2(q: str, ctx: MidiOpContext) -> str:
         return _query_status(ctx)
     elif command == "find":
         return _query_find(args, ctx)
-    elif command == "tracker":
+    elif command in ("tracker", "piano-roll"):
         return _query_tracker(args, ctx)
     elif command == "history":
         return _query_history(args, ctx)

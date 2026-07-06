@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from fcp_midi.errors import ValidationError
-from fcp_midi.model.song import Pitch, TimeSignature
+from fcp_midi.model.types import Pitch, TimeSignature
 from fcp_midi.parser.tokenizer import is_key_value, parse_key_value, tokenize
 from fcp_midi.parser.pitch import parse_pitch
 from fcp_midi.parser.duration import parse_duration

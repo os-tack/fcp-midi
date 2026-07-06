@@ -209,6 +209,16 @@ class MidiAdapterV2:
         model.restore(event.after)
         self.note_index.rebuild(model)
 
+    def take_snapshot(self, model: MidiModel) -> bytes:
+        """Byte snapshot for batch atomicity (fcp-core rolls the whole
+        batch back to this if any op in it fails)."""
+        return model.snapshot()
+
+    def restore_snapshot(self, model: MidiModel, snapshot: bytes) -> None:
+        """Restore the model from a batch-atomicity snapshot."""
+        model.restore(snapshot)
+        self.note_index.rebuild(model)
+
     # -- Tracker block-mode helpers --
 
     def _start_tracker(self, raw: str, model: MidiModel) -> OpResult:

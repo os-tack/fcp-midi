@@ -27,7 +27,7 @@ from fcp_midi.server.ops_context_v2 import (
     max_tick_v2,
     resolve_track_v2,
 )
-from fcp_midi.server.resolvers import (
+from fcp_midi.server.resolvers_v2 import (
     resolve_bank,
     resolve_instrument,
     resolve_velocity,

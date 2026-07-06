@@ -13,7 +13,7 @@ from __future__ import annotations
 import re
 
 from fcp_midi.errors import ValidationError
-from fcp_midi.model.song import Pitch
+from fcp_midi.model.types import Pitch
 
 # Semitone offsets for natural notes (C-based)
 _NOTE_OFFSETS: dict[str, int] = {
