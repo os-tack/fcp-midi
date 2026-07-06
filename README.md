@@ -4,7 +4,7 @@ MCP server for semantic MIDI composition.
 
 ## What It Does
 
-fcp-midi lets LLMs compose music by describing musical intent -- notes, chords, dynamics, tempo changes -- and renders it into standard MIDI files. Instead of manipulating raw bytes or MIDI events, the LLM works with operations like `note Bass E2 at:1.1 dur:quarter vel:90` and `crescendo @track:Lead vel:45-75 @range:3.1-6.4`. Built on the [FCP](https://github.com/os-tack/fcp) framework, powered by pretty-midi for serialization.
+fcp-midi lets LLMs compose music by describing musical intent -- notes, chords, dynamics, tempo changes -- and renders it into standard MIDI files. Instead of manipulating raw bytes or MIDI events, the LLM works with operations like `note Bass E2 at:1.1 dur:quarter vel:90` and `crescendo @track:Lead vel:45-75 @range:3.1-6.4`. Built on the [FCP](https://github.com/os-tack/fcp) framework; a `mido.MidiFile` is the source of truth throughout, so there's no separate serialization step.
 
 ## Quick Example
 
@@ -62,18 +62,16 @@ pip install fcp-midi
 
 ## Architecture
 
-3-layer architecture:
+Mido-native — no parallel semantic model between the op handlers and the file format:
 
 ```
-MCP Server (Intent Layer)
-  Parses op strings, dispatches to verb handlers
+MCP Server (fcp-core create_fcp_server + MidiAdapter)
+  Parses op strings, dispatches to verb handlers, session lifecycle
         |
-Semantic Model
-  Tracks, notes, chords, dynamics, tempo maps, markers
-  In-memory composition graph with event sourcing
-        |
-Serialization (pretty-midi)
-  Semantic model -> MIDI binary output
+MidiModel (mido.MidiFile is the source of truth)
+  Op handlers read/write mido messages directly on the tracks;
+  a NoteIndex gives fast selector lookups. Undo/redo and batch
+  atomicity are byte snapshots of the file, not event replay.
 ```
 
 Key features:
@@ -89,8 +87,8 @@ Key features:
 
 ```bash
 uv sync
-uv run pytest       # 658 tests
-uv run pytest -m "not slow"  # skip stress tests
+uv run pytest       # 620 tests
+uv run pytest -m "not slow"  # skip stress tests (604 tests, ~0.25s)
 uv run ruff check   # linting
 uv run pyright      # type checking
 ```
