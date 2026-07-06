@@ -1,26 +1,25 @@
-"""Centralized parameter parsing and resolution helpers.
+"""NoteIndex-based selector resolution for the mido-native architecture.
 
-Provides typed resolution functions that return parsed values or error
-strings, plus the ``OpContext`` dataclass shared by all op handlers.
+Supports all selector types: @track:NAME, @pitch:P, @range:M.B-M.B,
+@channel:N, @velocity:LO-HI, @all, @recent:N, and negation via
+@not:type:value.
+
+Also houses the instrument/bank/velocity resolution helpers.
 """
 
 from __future__ import annotations
 
-import difflib
 from dataclasses import dataclass
 
-from fcp_midi.lib.instrument_registry import InstrumentRegistry
 from fcp_midi.lib.gm_instruments import instrument_to_program, program_to_instrument
-from fcp_midi.model.event_log import EventLog
-from fcp_midi.model.registry import Registry
-from fcp_midi.model.song import Note, Pitch, Song, Track
-from fcp_midi.model.timing import ticks_to_position
-from fcp_midi.parser.pitch import parse_pitch, _MIDI_TO_NOTE
-from fcp_midi.parser.position import parse_position, _ticks_per_beat
-from fcp_midi.parser.duration import parse_duration
-from fcp_midi.parser.selector import Selector
+from fcp_midi.lib.instrument_registry import InstrumentRegistry
 from fcp_midi.lib.velocity_names import parse_velocity
+from fcp_midi.model.midi_model import NoteIndex, NoteRef
+from fcp_midi.parser.pitch import parse_pitch
+from fcp_midi.parser.position import parse_position, _ticks_per_beat
+from fcp_midi.parser.selector import Selector
 from fcp_midi.server.formatter import format_result
+from fcp_midi.server.ops_context import MidiOpContext, get_time_sigs
 
 
 @dataclass
@@ -31,16 +30,6 @@ class InstrumentResolution:
     bank_msb: int | None
     bank_lsb: int | None
     is_drum_kit: bool = False
-
-
-@dataclass
-class OpContext:
-    """Shared state passed to every op handler."""
-    song: Song
-    event_log: EventLog
-    registry: Registry
-    last_tick: int
-    instrument_registry: InstrumentRegistry | None = None
 
 
 def resolve_bank(params: dict[str, str]) -> tuple[int | None, int | None] | str:
@@ -151,50 +140,6 @@ def resolve_instrument(
     )
 
 
-def resolve_channel(params: dict[str, str]) -> int | None:
-    """Parse ``ch`` param (1-indexed) to 0-indexed, or None if absent."""
-    if "ch" in params:
-        return int(params["ch"]) - 1
-    return None
-
-
-def display_channel(ch_0indexed: int) -> int:
-    """Convert internal 0-indexed channel to 1-indexed display."""
-    return ch_0indexed + 1
-
-
-def resolve_position(
-    params: dict[str, str],
-    song: Song,
-    last_tick: int,
-    key: str = "at",
-    default: str = "1.1",
-) -> int | str:
-    """Parse a position param, returning tick or error string."""
-    at_str = params.get(key, default)
-    try:
-        return parse_position(
-            at_str, song.time_signatures, song.ppqn,
-            reference_tick=last_tick, song_end_tick=max_tick(song),
-        )
-    except ValueError as e:
-        return format_result(False, f"Invalid position: {e}")
-
-
-def resolve_duration(
-    params: dict[str, str],
-    song: Song,
-    key: str = "dur",
-    default: str = "quarter",
-) -> int | str:
-    """Parse a duration param, returning ticks or error string."""
-    dur_str = params.get(key, default)
-    try:
-        return parse_duration(dur_str, song.ppqn)
-    except ValueError as e:
-        return format_result(False, f"Invalid duration: {e}")
-
-
 def resolve_velocity(
     params: dict[str, str],
     key: str = "vel",
@@ -208,51 +153,21 @@ def resolve_velocity(
         return format_result(False, f"Invalid velocity: {e}")
 
 
-def resolve_pitch(pitch_str: str) -> Pitch | str:
-    """Parse a pitch string, returning Pitch or error string."""
-    try:
-        return parse_pitch(pitch_str)
-    except ValueError as e:
-        return format_result(False, f"Invalid pitch: {e}")
-
-
-def resolve_track(song: Song, name: str | None) -> Track | str:
-    """Resolve a track name with fuzzy matching, returning Track or error string."""
-    if not name:
-        return format_result(False, "Missing track name")
-
-    track = song.get_track_by_name(name)
-    if track:
-        return track
-
-    suggestion = suggest_track_name(song, name)
-    return format_result(False, f"Track '{name}' not found", suggestion)
-
-
-def suggest_track_name(song: Song, name: str) -> str | None:
-    """Fuzzy-match a track name and return a suggestion string."""
-    if not song.tracks:
-        return None
-
-    existing = [t.name for t in song.tracks.values()]
-    matches = difflib.get_close_matches(name, existing, n=1, cutoff=0.4)
-    if matches:
-        return f"Did you mean '{matches[0]}'?"
-    return f"Available tracks: {', '.join(existing)}"
-
-
-def resolve_selectors(
+def resolve_notes(
     selectors: list[Selector],
-    song: Song,
-    registry: Registry,
-    event_log: EventLog,
-) -> list[Note] | str:
-    """Resolve selectors into a list of notes via the registry."""
-    if not selectors:
-        return format_result(False, "No selectors specified",
-                             "Use @track:NAME, @range:M.B-M.B, @pitch:P, @all, etc.")
+    ctx: MidiOpContext,
+) -> list[NoteRef] | str:
+    """Resolve selectors into NoteRefs using the NoteIndex.
 
-    # Separate positive and negated selectors
+    Returns a list of NoteRefs matching the selectors, or an error string.
+    """
+    if not selectors:
+        return format_result(
+            False,
+            "No selectors specified",
+            "Use @track:NAME, @range:M.B-M.B, @pitch:P, @all, etc.",
+        )
+
     positive = [s for s in selectors if not s.negated]
     negated = [s for s in selectors if s.negated]
 
@@ -266,6 +181,10 @@ def resolve_selectors(
     use_all = False
     use_recent: int | None = None
 
+    time_sigs = get_time_sigs(ctx.model)
+    ppqn = ctx.model.ppqn
+    idx = ctx.note_index
+
     for sel in positive:
         if sel.type == "track":
             track_name = sel.value
@@ -277,17 +196,15 @@ def resolve_selectors(
         elif sel.type == "range":
             range_parts = sel.value.split("-")
             if len(range_parts) != 2:
-                return format_result(False, f"Invalid range: {sel.value!r}", "@range:1.1-4.4")
+                return format_result(
+                    False, f"Invalid range: {sel.value!r}", "@range:1.1-4.4"
+                )
             try:
-                range_start = parse_position(
-                    range_parts[0], song.time_signatures, song.ppqn
-                )
-                range_end = parse_position(
-                    range_parts[1], song.time_signatures, song.ppqn
-                )
-                ts = song.time_signatures[0] if song.time_signatures else None
+                range_start = parse_position(range_parts[0], time_sigs, ppqn)
+                range_end = parse_position(range_parts[1], time_sigs, ppqn)
+                ts = time_sigs[0] if time_sigs else None
                 denom = ts.denominator if ts else 4
-                range_end += _ticks_per_beat(denom, song.ppqn)
+                range_end += _ticks_per_beat(denom, ppqn)
             except ValueError as e:
                 return format_result(False, f"Invalid range position: {e}")
         elif sel.type == "pitch":
@@ -299,76 +216,95 @@ def resolve_selectors(
         elif sel.type == "velocity":
             vel_parts = sel.value.split("-")
             if len(vel_parts) != 2:
-                return format_result(False, f"Invalid velocity range: {sel.value!r}")
+                return format_result(
+                    False, f"Invalid velocity range: {sel.value!r}"
+                )
             try:
                 vel_low = int(vel_parts[0])
                 vel_high = int(vel_parts[1])
             except ValueError:
-                return format_result(False, f"Invalid velocity values: {sel.value!r}")
+                return format_result(
+                    False, f"Invalid velocity values: {sel.value!r}"
+                )
         elif sel.type == "all":
             use_all = True
         elif sel.type == "recent":
             use_recent = int(sel.value) if sel.value else 1
 
+    # @recent: return the last N notes by absolute tick
     if use_recent is not None:
-        events = event_log.recent(use_recent)
-        note_ids = set()
-        for ev in events:
-            if hasattr(ev, "note_id"):
-                note_ids.add(ev.note_id)
-        notes = []
-        for track in song.tracks.values():
-            for nid, note in track.notes.items():
-                if nid in note_ids:
-                    notes.append(note)
-        return notes
+        all_notes = sorted(idx.all, key=lambda n: n.abs_tick, reverse=True)
+        return all_notes[:use_recent]
 
-    if use_all:
-        notes = registry.search()
-    elif not positive:
-        # Only negated selectors: start with all notes
-        notes = registry.search()
+    # Pick starting set via the most specific NoteIndex lookup
+    if use_all or (not positive and negated):
+        notes = list(idx.all)
+    elif track_name:
+        ref = ctx.model.get_track(track_name)
+        if not ref:
+            return format_result(False, f"Track '{track_name}' not found")
+        notes = list(idx.by_track.get(track_name, []))
+    elif pitch_midi is not None:
+        notes = list(idx.by_pitch.get(pitch_midi, []))
+    elif channel is not None:
+        notes = list(idx.by_channel.get(channel, []))
     else:
-        notes = registry.search(
-            track=track_name,
-            pitch=pitch_midi,
-            range_start=range_start,
-            range_end=range_end,
-            channel=channel,
-            vel_low=vel_low,
-            vel_high=vel_high,
-        )
+        notes = list(idx.all)
 
-    # Apply negated selectors: subtract matching notes
+    # Apply remaining positive filters
+    if track_name and not use_all:
+        # Already filtered by track as primary lookup — skip
+        pass
+    elif track_name:
+        notes = [n for n in notes if n.track_name == track_name]
+
+    if pitch_midi is not None and track_name:
+        # track was primary, still need pitch filter
+        notes = [n for n in notes if n.pitch == pitch_midi]
+    elif pitch_midi is not None:
+        # pitch was primary — skip
+        pass
+
+    if channel is not None and (track_name or pitch_midi is not None):
+        # channel wasn't primary, filter it
+        notes = [n for n in notes if n.channel == channel]
+
+    if range_start is not None and range_end is not None:
+        notes = [n for n in notes if range_start <= n.abs_tick < range_end]
+
+    if vel_low is not None and vel_high is not None:
+        notes = [n for n in notes if vel_low <= n.velocity <= vel_high]
+
+    # Apply negated selectors
     if negated and notes:
-        exclude_ids: set[str] = set()
         for sel in negated:
-            excluded = _resolve_single_selector(sel, song, registry)
-            if isinstance(excluded, str):
-                return excluded
-            exclude_ids.update(n.id for n in excluded)
-        notes = [n for n in notes if n.id not in exclude_ids]
+            result = _apply_negation(sel, notes, time_sigs, ppqn)
+            if isinstance(result, str):
+                return result
+            notes = result
 
     return notes
 
 
-def _resolve_single_selector(
+def _apply_negation(
     sel: Selector,
-    song: Song,
-    registry: Registry,
-) -> list[Note] | str:
-    """Resolve a single selector into a note list (for negation subtraction)."""
+    notes: list[NoteRef],
+    time_sigs: list,
+    ppqn: int,
+) -> list[NoteRef] | str:
+    """Subtract notes matching a single negated selector."""
     if sel.type == "track":
-        return registry.by_track(sel.value)
+        return [n for n in notes if n.track_name != sel.value]
     elif sel.type == "pitch":
         try:
             p = parse_pitch(sel.value)
-            return registry.by_pitch(p.midi_number)
+            return [n for n in notes if n.pitch != p.midi_number]
         except ValueError as e:
             return format_result(False, f"Invalid pitch: {e}")
     elif sel.type == "channel":
         try:
-            return registry.by_channel(int(sel.value))
+            ch = int(sel.value)
+            return [n for n in notes if n.channel != ch]
         except ValueError:
             return format_result(False, f"Invalid channel: {sel.value!r}")
     elif sel.type == "range":
@@ -376,12 +312,12 @@ def _resolve_single_selector(
         if len(range_parts) != 2:
             return format_result(False, f"Invalid range: {sel.value!r}")
         try:
-            start = parse_position(range_parts[0], song.time_signatures, song.ppqn)
-            end = parse_position(range_parts[1], song.time_signatures, song.ppqn)
-            ts = song.time_signatures[0] if song.time_signatures else None
+            start = parse_position(range_parts[0], time_sigs, ppqn)
+            end = parse_position(range_parts[1], time_sigs, ppqn)
+            ts = time_sigs[0] if time_sigs else None
             denom = ts.denominator if ts else 4
-            end += _ticks_per_beat(denom, song.ppqn)
-            return registry.by_range(start, end)
+            end += _ticks_per_beat(denom, ppqn)
+            return [n for n in notes if not (start <= n.abs_tick < end)]
         except ValueError as e:
             return format_result(False, f"Invalid range: {e}")
     elif sel.type == "velocity":
@@ -389,31 +325,9 @@ def _resolve_single_selector(
         if len(vel_parts) != 2:
             return format_result(False, f"Invalid velocity range: {sel.value!r}")
         try:
-            return registry.by_velocity_range(int(vel_parts[0]), int(vel_parts[1]))
+            lo = int(vel_parts[0])
+            hi = int(vel_parts[1])
+            return [n for n in notes if not (lo <= n.velocity <= hi)]
         except ValueError:
             return format_result(False, f"Invalid velocity: {sel.value!r}")
-    return []
-
-
-def pitch_from_midi(midi_number: int) -> Pitch:
-    """Create a Pitch from a raw MIDI number (uses sharps for black keys)."""
-    note_in_octave = midi_number % 12
-    octave = (midi_number // 12) - 1
-    name, accidental = _MIDI_TO_NOTE[note_in_octave]
-    return Pitch(
-        name=name,
-        accidental=accidental,
-        octave=octave,
-        midi_number=midi_number,
-    )
-
-
-def max_tick(song: Song) -> int:
-    """Find the maximum tick (note end) across all tracks."""
-    max_t = 0
-    for t in song.tracks.values():
-        for n in t.notes.values():
-            end = n.absolute_tick + n.duration_ticks
-            if end > max_t:
-                max_t = end
-    return max_t
+    return notes

@@ -1,7 +1,7 @@
 """MIDI FCP — File Context Protocol for MIDI composition.
 
 Uses ``create_fcp_server()`` from fcp_core to wire up the MCP server
-with the MIDI domain adapter.
+with the mido-native MIDI domain adapter.
 """
 
 from fcp_core import create_fcp_server

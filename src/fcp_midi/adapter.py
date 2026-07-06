@@ -1,45 +1,61 @@
-"""FcpDomainAdapter implementation for MIDI — bridges fcp-core to fcp-midi domain.
+"""FcpDomainAdapter implementation for mido-native MIDI — bridges fcp-core to MidiModel.
 
-This adapter satisfies the ``FcpDomainAdapter[Song, Event]`` protocol
-from fcp-core, delegating to the existing MIDI domain logic.
+Satisfies ``FcpDomainAdapter[MidiModel, SnapshotEvent]``. Uses byte snapshots
+for undo/redo instead of fine-grained event sourcing.
 """
 
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 from fcp_core import EventLog as CoreEventLog
 from fcp_core import OpResult, ParsedOp as GenericParsedOp
 
-from fcp_midi.errors import FcpError
 from fcp_midi.lib.instrument_registry import InstrumentRegistry
-from fcp_midi.model.event_log import Event
-from fcp_midi.model.registry import Registry
-from fcp_midi.model.song import Song
+from fcp_midi.model.midi_model import MidiModel, NoteIndex
 from fcp_midi.parser.ops import ParsedOp as DomainParsedOp, ParseError, parse_op as domain_parse_op
-from fcp_midi.parser.selector import Selector, parse_selectors
 from fcp_midi.server.formatter import format_result
-from fcp_midi.server.ops_editing import detect_gaps
-from fcp_midi.server.resolvers import OpContext
-from fcp_midi.server.sessions import reverse_event, replay_event
+from fcp_midi.server.ops_context import MidiOpContext
+from fcp_midi.server.queries import dispatch_query
 
+
+# ---------------------------------------------------------------------------
+# SnapshotEvent — simple event type for byte-snapshot undo/redo
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SnapshotEvent:
+    """Event type for byte-snapshot undo/redo."""
+
+    type: str = "snapshot"
+    before: bytes = b""
+    after: bytes = b""
+    summary: str = ""
+
+
+# ---------------------------------------------------------------------------
+# MidiAdapter
+# ---------------------------------------------------------------------------
 
 class MidiAdapter:
-    """FcpDomainAdapter implementation for MIDI composition.
+    """FcpDomainAdapter implementation for mido-native MIDI composition.
 
-    Satisfies the ``FcpDomainAdapter[Song, Event]`` protocol required
-    by ``create_fcp_server()``.
+    Satisfies ``FcpDomainAdapter[MidiModel, SnapshotEvent]``.
     """
 
     def __init__(self) -> None:
-        self.registry: Registry = Registry()
+        self.note_index: NoteIndex = NoteIndex()
         self.instrument_registry: InstrumentRegistry = InstrumentRegistry()
         self._last_tick: int = 0
+        # Tracker block-mode import state
+        self._tracker_buffer: list[str] | None = None
+        self._tracker_header: str | None = None
 
     # -- FcpDomainAdapter protocol methods --
 
-    def create_empty(self, title: str, params: dict[str, str]) -> Song:
-        """Create a new empty Song from session params."""
+    def create_empty(self, title: str, params: dict[str, str]) -> MidiModel:
+        """Create a new empty MidiModel from session params."""
         tempo = 120.0
         time_sig = (4, 4)
         key: str | None = None
@@ -49,7 +65,7 @@ class MidiAdapter:
             try:
                 tempo = float(params["tempo"])
             except ValueError:
-                pass  # will use default
+                pass
 
         if "time-sig" in params:
             m = re.match(r"^(\d+)/(\d+)$", params["time-sig"])
@@ -65,51 +81,104 @@ class MidiAdapter:
             except ValueError:
                 pass
 
-        song = Song.create(title=title, tempo=tempo, time_sig=time_sig, key=key, ppqn=ppqn)
-        self.registry = Registry()
-        return song
+        model = MidiModel(
+            title=title,
+            ppqn=ppqn,
+            tempo=tempo,
+            time_sig=time_sig,
+            key=key,
+        )
+        self.note_index = NoteIndex()
+        self._last_tick = 0
+        return model
 
-    def serialize(self, model: Song, path: str) -> None:
-        """Serialize the song to a MIDI file."""
-        from fcp_midi.serialization.serialize import serialize
-        serialize(model, path)
+    def serialize(self, model: MidiModel, path: str) -> None:
+        """Serialize — model.save(path)."""
+        model.save(path)
 
-    def deserialize(self, path: str) -> Song:
-        """Deserialize a Song from a MIDI file."""
-        from fcp_midi.serialization.deserialize import deserialize
-        return deserialize(path)
+    def deserialize(self, path: str) -> MidiModel:
+        """Deserialize — MidiModel.load(path)."""
+        model = MidiModel.load(path)
+        self.note_index.rebuild(model)
+        return model
 
-    def rebuild_indices(self, model: Song) -> None:
-        """Rebuild the note registry from the song model."""
-        self.registry.rebuild(model)
+    def rebuild_indices(self, model: MidiModel) -> None:
+        """Rebuild NoteIndex."""
+        self.note_index.rebuild(model)
 
-    def get_digest(self, model: Song) -> str:
+    def get_digest(self, model: MidiModel) -> str:
         """Return a compact state fingerprint."""
         return model.get_digest()
 
     def dispatch_op(
         self,
         op: GenericParsedOp,
-        model: Song,
+        model: MidiModel,
         log: CoreEventLog,
     ) -> OpResult:
-        """Execute a parsed operation on the song.
+        """Execute a parsed operation on the model.
 
-        Converts generic ParsedOp from fcp-core into the domain-specific
-        ParsedOp, then delegates to the existing op handler pipeline.
+        1. Check for tracker block-mode intercept
+        2. Take byte snapshot (for undo)
+        3. Build MidiOpContext
+        4. Re-parse through domain parser
+        5. Dispatch to handler
+        6. Rebuild note index
+        7. Log snapshot event
+        8. Return OpResult
         """
-        # Re-parse through our domain parser to get domain-specific ParsedOp
+        raw = op.raw.strip()
+
+        # -- Tracker block-mode intercept --
+        # Accumulating step lines into buffer
+        if self._tracker_buffer is not None:
+            if raw.lower().startswith("tracker") and "end" in raw.lower():
+                return self._flush_tracker(model, log)
+            # Nested tracker blocks are forbidden
+            if raw.lower().startswith("tracker") and "import" in raw.lower():
+                return OpResult(success=False, message="Nested tracker blocks are not allowed")
+            self._tracker_buffer.append(raw)
+            return OpResult(success=True, message="", prefix="~")
+
+        # Start a new tracker block
+        if raw.lower().startswith("tracker") and "import" in raw.lower():
+            return self._start_tracker(raw, model)
+
+        # -- End tracker-end without prior import --
+        if raw.lower().startswith("tracker") and "end" in raw.lower():
+            return OpResult(success=False, message="'tracker end' without prior 'tracker ... import'")
+
+        # Take pre-op snapshot
+        before = model.snapshot()
+
+        # Build context
+        ctx = MidiOpContext(
+            model=model,
+            note_index=self.note_index,
+            instrument_registry=self.instrument_registry,
+            last_tick=self._last_tick,
+        )
+
+        # Re-parse through domain parser
         domain_parsed = domain_parse_op(op.raw)
         if isinstance(domain_parsed, ParseError):
             return OpResult(success=False, message=f"Parse error: {domain_parsed.error}")
 
-        # Build an OpContext and dispatch
-        ctx = self._make_context(model, log)
+        # Dispatch to handler
         try:
-            result_str = self._dispatch_domain_op(domain_parsed, ctx)
-            self._sync_from_context(ctx)
-        except (FcpError, ValueError) as exc:
+            result_str = self._dispatch(domain_parsed, ctx)
+        except (ValueError, KeyError) as exc:
             return OpResult(success=False, message=f"Error: {exc}")
+
+        # Sync state back
+        self._last_tick = ctx.last_tick
+
+        # Rebuild index
+        self.note_index.rebuild(model)
+
+        # Log snapshot for undo
+        after = model.snapshot()
+        log.append(SnapshotEvent(before=before, after=after, summary=op.raw))
 
         # Parse the result string into OpResult
         if result_str.startswith("!"):
@@ -120,43 +189,147 @@ class MidiAdapter:
         message = result_str[2:] if prefix else result_str
         return OpResult(success=True, message=message, prefix=prefix)
 
-    def dispatch_query(self, query: str, model: Song) -> str:
-        """Execute a read-only query against the song."""
-        from fcp_midi.server.queries import dispatch_query
-        ctx = self._make_context(model)
+    def dispatch_query(self, query: str, model: MidiModel) -> str:
+        """Execute query via dispatch_query."""
+        ctx = MidiOpContext(
+            model=model,
+            note_index=self.note_index,
+            instrument_registry=self.instrument_registry,
+            last_tick=self._last_tick,
+        )
         return dispatch_query(query, ctx)
 
-    def reverse_event(self, event: Event, model: Song) -> None:
-        """Reverse a single event (for undo)."""
-        reverse_event(event, model)
+    def reverse_event(self, event: SnapshotEvent, model: MidiModel) -> None:
+        """Undo — restore from before-snapshot."""
+        model.restore(event.before)
+        self.note_index.rebuild(model)
 
-    def replay_event(self, event: Event, model: Song) -> None:
-        """Replay a single event (for redo)."""
-        replay_event(event, model)
+    def replay_event(self, event: SnapshotEvent, model: MidiModel) -> None:
+        """Redo — restore from after-snapshot."""
+        model.restore(event.after)
+        self.note_index.rebuild(model)
 
-    # -- Internal helpers --
+    def take_snapshot(self, model: MidiModel) -> bytes:
+        """Byte snapshot for batch atomicity (fcp-core rolls the whole
+        batch back to this if any op in it fails)."""
+        return model.snapshot()
 
-    def _make_context(self, song: Song, log: CoreEventLog | None = None) -> OpContext:
-        """Build an OpContext from current state."""
-        # Create a shim EventLog that wraps the core EventLog
-        from fcp_midi.model.event_log import EventLog as DomainEventLog
-        if log is not None:
-            event_log = _CoreEventLogShim(log)
-        else:
-            event_log = DomainEventLog()
-        return OpContext(
-            song=song,
-            event_log=event_log,
-            registry=self.registry,
-            last_tick=self._last_tick,
-            instrument_registry=self.instrument_registry,
+    def restore_snapshot(self, model: MidiModel, snapshot: bytes) -> None:
+        """Restore the model from a batch-atomicity snapshot."""
+        model.restore(snapshot)
+        self.note_index.rebuild(model)
+
+    # -- Tracker block-mode helpers --
+
+    def _start_tracker(self, raw: str, model: MidiModel) -> OpResult:
+        """Begin accumulating tracker step lines."""
+        # Parse: "tracker TRACK import at:POS [res:RES]"
+        parts = raw.split()
+        if len(parts) < 3:
+            return OpResult(success=False, message="Usage: tracker TRACK import at:POS [res:RES]")
+
+        track_name = parts[1]
+        ref = model.get_track(track_name)
+        if ref is None:
+            return OpResult(success=False, message=f"Track '{track_name}' not found")
+
+        self._tracker_buffer = []
+        self._tracker_header = raw
+        return OpResult(success=True, message="", prefix="~")
+
+    def _flush_tracker(self, model: MidiModel, log: CoreEventLog) -> OpResult:
+        """Process accumulated tracker step lines and import notes."""
+        from fcp_midi.server.tracker_format import (
+            parse_step_line,
+            pair_tracker_events,
+            _ticks_per_step,
+        )
+        from fcp_midi.server.ops_context import get_time_sigs
+        from fcp_midi.parser.position import parse_position
+
+        header = self._tracker_header or ""
+        buffer = self._tracker_buffer or []
+        self._tracker_buffer = None
+        self._tracker_header = None
+
+        # Parse header: "tracker TRACK import at:POS [res:RES]"
+        parts = header.split()
+        track_name = parts[1] if len(parts) > 1 else ""
+        ref = model.get_track(track_name)
+        if ref is None:
+            return OpResult(success=False, message=f"Track '{track_name}' not found")
+
+        # Extract params
+        at_pos: str | None = None
+        resolution = "16th"
+        for p in parts:
+            if p.startswith("at:"):
+                at_pos = p[3:]
+            elif p.startswith("res:"):
+                resolution = p[4:]
+
+        time_sigs = get_time_sigs(model)
+        ppqn = model.ppqn
+
+        if at_pos is None:
+            return OpResult(success=False, message="Missing at: parameter for tracker import")
+
+        try:
+            start_tick = parse_position(at_pos, time_sigs, ppqn)
+        except ValueError as e:
+            return OpResult(success=False, message=f"Invalid position: {e}")
+
+        try:
+            tps = _ticks_per_step(resolution, ppqn)
+        except ValueError as e:
+            return OpResult(success=False, message=str(e))
+
+        # Take before-snapshot
+        before = model.snapshot()
+
+        # Parse step lines
+        steps: list[tuple[int, list[tuple[int, int, int]]]] = []
+        for line in buffer:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                step_data = parse_step_line(line)
+                steps.append(step_data)
+            except ValueError as e:
+                # Restore and report error
+                return OpResult(success=False, message=f"Bad step line: {e}")
+
+        if not steps:
+            return OpResult(success=False, message="No step lines in tracker block")
+
+        # Pair ON/OFF events into notes
+        paired = pair_tracker_events(steps, start_tick, tps)
+
+        # Add notes to model
+        for pitch, velocity, abs_tick, duration in paired:
+            model.add_note(track_name, pitch, abs_tick, duration, velocity)
+
+        # Rebuild index
+        self.note_index.rebuild(model)
+
+        # Log snapshot for undo
+        after = model.snapshot()
+        log.append(SnapshotEvent(
+            before=before,
+            after=after,
+            summary=f"tracker import {track_name} ({len(paired)} notes)",
+        ))
+
+        return OpResult(
+            success=True,
+            message=f"Imported {len(paired)} notes from {len(steps)} steps",
+            prefix="+",
         )
 
-    def _sync_from_context(self, ctx: OpContext) -> None:
-        """Sync mutable state back from OpContext."""
-        self._last_tick = ctx.last_tick
+    # -- Internal dispatch --
 
-    def _dispatch_domain_op(self, op: DomainParsedOp, ctx: OpContext) -> str:
+    def _dispatch(self, op: DomainParsedOp, ctx: MidiOpContext) -> str:
         """Route a domain-parsed op to the appropriate handler."""
         from fcp_midi.server.ops_music import (
             op_note, op_chord, op_track, op_cc, op_bend,
@@ -200,45 +373,3 @@ class MidiAdapter:
             return format_result(False, f"Unknown verb: {op.verb!r}")
 
         return handler(op, ctx)
-
-
-class _CoreEventLogShim:
-    """Wraps a fcp-core EventLog to satisfy the domain EventLog interface.
-
-    The domain code (op handlers, resolvers) uses the EventLog interface with
-    methods like .append(), .checkpoint(), .undo(), .redo(), .recent(), .cursor,
-    and .events. This shim delegates to the core EventLog while maintaining
-    compatibility with domain event types.
-    """
-
-    def __init__(self, core_log: CoreEventLog) -> None:
-        self._core = core_log
-
-    @property
-    def cursor(self) -> int:
-        return self._core.cursor
-
-    @property
-    def events(self) -> list:
-        return self._core.recent(self._core.cursor)
-
-    def append(self, event: Event) -> None:
-        self._core.append(event)
-
-    def checkpoint(self, name: str) -> None:
-        self._core.checkpoint(name)
-
-    def undo(self, count: int = 1) -> list:
-        return self._core.undo(count)
-
-    def undo_to(self, name: str) -> list:
-        result = self._core.undo_to(name)
-        if result is None:
-            raise KeyError(f"No checkpoint named {name!r}")
-        return result
-
-    def redo(self, count: int = 1) -> list:
-        return self._core.redo(count)
-
-    def recent(self, count: int = 5) -> list:
-        return self._core.recent(count)

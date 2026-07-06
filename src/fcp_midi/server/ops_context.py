@@ -78,7 +78,7 @@ def get_tempo_bpm(model: MidiModel) -> float:
     return 120.0
 
 
-def max_tick_v2(model: MidiModel) -> int:
+def max_tick(model: MidiModel) -> int:
     """Find the maximum tick (note end) across all tracks."""
     max_t = 0
     for ref in model.tracks.values():
@@ -95,7 +95,7 @@ def max_tick_v2(model: MidiModel) -> int:
 # Track resolution helpers
 # ---------------------------------------------------------------------------
 
-def resolve_track_v2(model: MidiModel, name: str | None) -> TrackRef | str:
+def resolve_track(model: MidiModel, name: str | None) -> TrackRef | str:
     """Resolve a track name, returning TrackRef or error string."""
     if not name:
         return format_result(False, "Missing track name")
@@ -104,11 +104,11 @@ def resolve_track_v2(model: MidiModel, name: str | None) -> TrackRef | str:
     if ref:
         return ref
 
-    suggestion = suggest_track_name_v2(model, name)
+    suggestion = suggest_track_name(model, name)
     return format_result(False, f"Track '{name}' not found", suggestion)
 
 
-def suggest_track_name_v2(model: MidiModel, name: str) -> str | None:
+def suggest_track_name(model: MidiModel, name: str) -> str | None:
     """Fuzzy-match a track name and return a suggestion string."""
     if not model.tracks:
         return None

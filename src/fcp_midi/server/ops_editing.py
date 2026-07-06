@@ -1,28 +1,43 @@
-"""Op handlers for editing: remove, move, copy, transpose, velocity, quantize,
-modify, repeat, crescendo/decrescendo, plus gap detection."""
+"""Op handlers for editing: remove, move, copy, transpose, velocity,
+quantize, modify, repeat, crescendo/decrescendo.
+
+These operate directly on MidiModel via mido messages. Selector
+resolution uses resolve_notes from resolvers.py (NoteIndex-based).
+"""
 
 from __future__ import annotations
 
-import copy
+import mido
 
-from fcp_midi.model.event_log import NoteAdded, NoteModified, NoteRemoved
+from fcp_midi.model.midi_model import (
+    MidiModel,
+    NoteRef,
+    delta_to_absolute,
+    insert_message_at_tick,
+    remove_message_at_index,
+)
 from fcp_midi.model.timing import ticks_to_position
 from fcp_midi.parser.duration import parse_duration
 from fcp_midi.parser.ops import ParsedOp
 from fcp_midi.parser.pitch import parse_pitch
-from fcp_midi.parser.position import parse_position, _ticks_per_measure
+from fcp_midi.parser.position import parse_position
+from fcp_midi.parser.selector import Selector
 from fcp_midi.lib.velocity_names import parse_velocity
 from fcp_midi.server.formatter import format_result
-from fcp_midi.server.resolvers import (
-    OpContext,
+from fcp_midi.server.ops_context import (
+    MidiOpContext,
+    get_time_sigs,
     max_tick,
-    pitch_from_midi,
-    resolve_selectors,
 )
+from fcp_midi.server.resolvers import resolve_notes
 
 
-def op_remove(op: ParsedOp, ctx: OpContext) -> str:
-    notes = resolve_selectors(op.selectors, ctx.song, ctx.registry, ctx.event_log)
+# ---------------------------------------------------------------------------
+# remove
+# ---------------------------------------------------------------------------
+
+def op_remove(op: ParsedOp, ctx: MidiOpContext) -> str:
+    notes = resolve_notes(op.selectors, ctx)
     if isinstance(notes, str):
         return notes
     if not notes:
@@ -30,18 +45,20 @@ def op_remove(op: ParsedOp, ctx: OpContext) -> str:
 
     count = 0
     for note in notes:
-        removed = ctx.song.remove_note(note.track_id, note.id)
+        removed = ctx.model.remove_note_at(note.track_name, note.pitch, note.abs_tick)
         if removed:
-            ctx.event_log.append(NoteRemoved(track_id=note.track_id, note_id=note.id, note_snapshot=copy.copy(note)))
-            track = ctx.song.tracks.get(note.track_id)
-            track_name = track.name if track else ""
-            ctx.registry.remove_note(note, track_name)
             count += 1
+
+    ctx.note_index.rebuild(ctx.model)
     return format_result(True, f"Removed {count} note(s)")
 
 
-def op_move(op: ParsedOp, ctx: OpContext) -> str:
-    notes = resolve_selectors(op.selectors, ctx.song, ctx.registry, ctx.event_log)
+# ---------------------------------------------------------------------------
+# move
+# ---------------------------------------------------------------------------
+
+def op_move(op: ParsedOp, ctx: MidiOpContext) -> str:
+    notes = resolve_notes(op.selectors, ctx)
     if isinstance(notes, str):
         return notes
     if not notes:
@@ -51,31 +68,44 @@ def op_move(op: ParsedOp, ctx: OpContext) -> str:
     if not to_str:
         return format_result(False, "Missing to: parameter", "move @track:Piano to:3.1")
 
+    time_sigs = get_time_sigs(ctx.model)
     try:
         to_tick = parse_position(
-            to_str, ctx.song.time_signatures, ctx.song.ppqn,
-            reference_tick=ctx.last_tick, song_end_tick=max_tick(ctx.song),
+            to_str, time_sigs, ctx.model.ppqn,
+            reference_tick=ctx.last_tick, song_end_tick=max_tick(ctx.model),
         )
     except ValueError as e:
         return format_result(False, f"Invalid position: {e}")
 
-    min_tick_val = min(n.absolute_tick for n in notes)
+    min_tick_val = min(n.abs_tick for n in notes)
     delta = to_tick - min_tick_val
 
-    for note in notes:
-        old_tick = note.absolute_tick
-        note.absolute_tick = max(0, note.absolute_tick + delta)
-        ctx.event_log.append(NoteModified(
-            track_id=note.track_id, note_id=note.id,
-            field_name="absolute_tick", old_value=old_tick, new_value=note.absolute_tick,
-        ))
+    # Collect note data first, then remove, then re-add
+    note_data = [
+        (n.track_name, n.pitch, n.abs_tick, n.duration_ticks, n.velocity, n.channel)
+        for n in notes
+    ]
 
-    pos = ticks_to_position(to_tick, ctx.song.time_signatures, ctx.song.ppqn)
+    # Remove all old notes
+    for n in notes:
+        ctx.model.remove_note_at(n.track_name, n.pitch, n.abs_tick)
+
+    # Re-add at new positions
+    for track_name, pitch, old_tick, dur, vel, ch in note_data:
+        new_tick = max(0, old_tick + delta)
+        ctx.model.add_note(track_name, pitch, new_tick, dur, vel, ch)
+
+    ctx.note_index.rebuild(ctx.model)
+    pos = ticks_to_position(to_tick, time_sigs, ctx.model.ppqn)
     return format_result(True, f"Moved {len(notes)} note(s) to {pos}")
 
 
-def op_copy(op: ParsedOp, ctx: OpContext) -> str:
-    notes = resolve_selectors(op.selectors, ctx.song, ctx.registry, ctx.event_log)
+# ---------------------------------------------------------------------------
+# copy
+# ---------------------------------------------------------------------------
+
+def op_copy(op: ParsedOp, ctx: MidiOpContext) -> str:
+    notes = resolve_notes(op.selectors, ctx)
     if isinstance(notes, str):
         return notes
     if not notes:
@@ -85,34 +115,33 @@ def op_copy(op: ParsedOp, ctx: OpContext) -> str:
     if not to_str:
         return format_result(False, "Missing to: parameter")
 
+    time_sigs = get_time_sigs(ctx.model)
     try:
         to_tick = parse_position(
-            to_str, ctx.song.time_signatures, ctx.song.ppqn,
-            reference_tick=ctx.last_tick, song_end_tick=max_tick(ctx.song),
+            to_str, time_sigs, ctx.model.ppqn,
+            reference_tick=ctx.last_tick, song_end_tick=max_tick(ctx.model),
         )
     except ValueError as e:
         return format_result(False, f"Invalid position: {e}")
 
-    min_tick_val = min(n.absolute_tick for n in notes)
+    min_tick_val = min(n.abs_tick for n in notes)
     delta = to_tick - min_tick_val
 
-    for note in notes:
-        new_tick = max(0, note.absolute_tick + delta)
-        new_note = ctx.song.add_note(
-            note.track_id, note.pitch, new_tick,
-            note.duration_ticks, note.velocity, note.channel,
-        )
-        ctx.event_log.append(NoteAdded(track_id=note.track_id, note_id=new_note.id, note_snapshot=copy.copy(new_note)))
-        track = ctx.song.tracks.get(note.track_id)
-        track_name = track.name if track else ""
-        ctx.registry.add_note(new_note, track_name)
+    for n in notes:
+        new_tick = max(0, n.abs_tick + delta)
+        ctx.model.add_note(n.track_name, n.pitch, new_tick, n.duration_ticks, n.velocity, n.channel)
 
-    pos = ticks_to_position(to_tick, ctx.song.time_signatures, ctx.song.ppqn)
+    ctx.note_index.rebuild(ctx.model)
+    pos = ticks_to_position(to_tick, time_sigs, ctx.model.ppqn)
     return format_result(True, f"Copied {len(notes)} note(s) to {pos}")
 
 
-def op_transpose(op: ParsedOp, ctx: OpContext) -> str:
-    notes = resolve_selectors(op.selectors, ctx.song, ctx.registry, ctx.event_log)
+# ---------------------------------------------------------------------------
+# transpose
+# ---------------------------------------------------------------------------
+
+def op_transpose(op: ParsedOp, ctx: MidiOpContext) -> str:
+    notes = resolve_notes(op.selectors, ctx)
     if isinstance(notes, str):
         return notes
     if not notes:
@@ -127,26 +156,33 @@ def op_transpose(op: ParsedOp, ctx: OpContext) -> str:
     except ValueError:
         return format_result(False, f"Invalid semitone value: {semitones_str!r}")
 
+    # Collect note data, remove old, add transposed
+    note_data = [
+        (n.track_name, n.pitch, n.abs_tick, n.duration_ticks, n.velocity, n.channel)
+        for n in notes
+    ]
+
+    for n in notes:
+        ctx.model.remove_note_at(n.track_name, n.pitch, n.abs_tick)
+
     count = 0
-    for note in notes:
-        new_midi = note.pitch.midi_number + semitones
-        if 0 <= new_midi <= 127:
-            old_pitch = note.pitch
-            note.pitch = pitch_from_midi(new_midi)
-            ctx.event_log.append(NoteModified(
-                track_id=note.track_id, note_id=note.id,
-                field_name="pitch", old_value=old_pitch, new_value=note.pitch,
-            ))
-            track = ctx.song.tracks.get(note.track_id)
-            track_name = track.name if track else ""
-            ctx.registry.update_note(note, track_name, "pitch", old_pitch)
+    for track_name, pitch, tick, dur, vel, ch in note_data:
+        new_pitch = pitch + semitones
+        if 0 <= new_pitch <= 127:
+            ctx.model.add_note(track_name, new_pitch, tick, dur, vel, ch)
             count += 1
+
+    ctx.note_index.rebuild(ctx.model)
     direction = "up" if semitones > 0 else "down"
     return format_result(True, f"Transposed {count} note(s) {direction} {abs(semitones)} semitones")
 
 
-def op_velocity(op: ParsedOp, ctx: OpContext) -> str:
-    notes = resolve_selectors(op.selectors, ctx.song, ctx.registry, ctx.event_log)
+# ---------------------------------------------------------------------------
+# velocity
+# ---------------------------------------------------------------------------
+
+def op_velocity(op: ParsedOp, ctx: MidiOpContext) -> str:
+    notes = resolve_notes(op.selectors, ctx)
     if isinstance(notes, str):
         return notes
     if not notes:
@@ -161,19 +197,29 @@ def op_velocity(op: ParsedOp, ctx: OpContext) -> str:
     except ValueError:
         return format_result(False, f"Invalid velocity delta: {delta_str!r}")
 
-    for note in notes:
-        old_vel = note.velocity
-        note.velocity = max(1, min(127, note.velocity + delta))
-        ctx.event_log.append(NoteModified(
-            track_id=note.track_id, note_id=note.id,
-            field_name="velocity", old_value=old_vel, new_value=note.velocity,
-        ))
+    # Collect, remove, re-add with new velocity
+    note_data = [
+        (n.track_name, n.pitch, n.abs_tick, n.duration_ticks, n.velocity, n.channel)
+        for n in notes
+    ]
 
+    for n in notes:
+        ctx.model.remove_note_at(n.track_name, n.pitch, n.abs_tick)
+
+    for track_name, pitch, tick, dur, vel, ch in note_data:
+        new_vel = max(1, min(127, vel + delta))
+        ctx.model.add_note(track_name, pitch, tick, dur, new_vel, ch)
+
+    ctx.note_index.rebuild(ctx.model)
     return format_result(True, f"Adjusted velocity of {len(notes)} note(s) by {delta:+d}")
 
 
-def op_quantize(op: ParsedOp, ctx: OpContext) -> str:
-    notes = resolve_selectors(op.selectors, ctx.song, ctx.registry, ctx.event_log)
+# ---------------------------------------------------------------------------
+# quantize
+# ---------------------------------------------------------------------------
+
+def op_quantize(op: ParsedOp, ctx: MidiOpContext) -> str:
+    notes = resolve_notes(op.selectors, ctx)
     if isinstance(notes, str):
         return notes
     if not notes:
@@ -181,24 +227,33 @@ def op_quantize(op: ParsedOp, ctx: OpContext) -> str:
 
     grid_str = op.params.get("grid", "quarter")
     try:
-        grid_ticks = parse_duration(grid_str, ctx.song.ppqn)
+        grid_ticks = parse_duration(grid_str, ctx.model.ppqn)
     except ValueError as e:
         return format_result(False, f"Invalid grid: {e}")
 
-    for note in notes:
-        old_tick = note.absolute_tick
-        note.absolute_tick = round(note.absolute_tick / grid_ticks) * grid_ticks
-        if note.absolute_tick != old_tick:
-            ctx.event_log.append(NoteModified(
-                track_id=note.track_id, note_id=note.id,
-                field_name="absolute_tick", old_value=old_tick, new_value=note.absolute_tick,
-            ))
+    # Collect, remove, re-add at quantized positions
+    note_data = [
+        (n.track_name, n.pitch, n.abs_tick, n.duration_ticks, n.velocity, n.channel)
+        for n in notes
+    ]
 
+    for n in notes:
+        ctx.model.remove_note_at(n.track_name, n.pitch, n.abs_tick)
+
+    for track_name, pitch, tick, dur, vel, ch in note_data:
+        new_tick = round(tick / grid_ticks) * grid_ticks
+        ctx.model.add_note(track_name, pitch, new_tick, dur, vel, ch)
+
+    ctx.note_index.rebuild(ctx.model)
     return format_result(True, f"Quantized {len(notes)} note(s) to {grid_str}")
 
 
-def op_modify(op: ParsedOp, ctx: OpContext) -> str:
-    notes = resolve_selectors(op.selectors, ctx.song, ctx.registry, ctx.event_log)
+# ---------------------------------------------------------------------------
+# modify
+# ---------------------------------------------------------------------------
+
+def op_modify(op: ParsedOp, ctx: MidiOpContext) -> str:
+    notes = resolve_notes(op.selectors, ctx)
     if isinstance(notes, str):
         return notes
     if not notes:
@@ -209,86 +264,76 @@ def op_modify(op: ParsedOp, ctx: OpContext) -> str:
     if not has_mod:
         return format_result(False, "No modification specified")
 
+    # Parse new values upfront to fail early
+    new_pitch_midi: int | None = None
+    new_vel: int | None = None
+    new_dur: int | None = None
+    new_tick: int | None = None
+    new_ch: int | None = None
+
+    if "pitch" in op.params:
+        try:
+            p = parse_pitch(op.params["pitch"])
+            new_pitch_midi = p.midi_number
+        except ValueError as e:
+            return format_result(False, f"Invalid pitch: {e}")
+
+    if "vel" in op.params:
+        try:
+            new_vel = parse_velocity(op.params["vel"])
+        except ValueError as e:
+            return format_result(False, f"Invalid velocity: {e}")
+
+    if "dur" in op.params:
+        try:
+            new_dur = parse_duration(op.params["dur"], ctx.model.ppqn)
+        except ValueError as e:
+            return format_result(False, f"Invalid duration: {e}")
+
+    if "at" in op.params:
+        time_sigs = get_time_sigs(ctx.model)
+        try:
+            new_tick = parse_position(
+                op.params["at"], time_sigs, ctx.model.ppqn,
+                reference_tick=ctx.last_tick, song_end_tick=max_tick(ctx.model),
+            )
+        except ValueError as e:
+            return format_result(False, f"Invalid position: {e}")
+
+    if "ch" in op.params:
+        new_ch = int(op.params["ch"]) - 1
+
+    # Collect, remove, re-add modified
+    note_data = [
+        (n.track_name, n.pitch, n.abs_tick, n.duration_ticks, n.velocity, n.channel)
+        for n in notes
+    ]
+
+    for n in notes:
+        ctx.model.remove_note_at(n.track_name, n.pitch, n.abs_tick)
+
     count = 0
-    for note in notes:
-        modified = False
+    for track_name, pitch, tick, dur, vel, ch in note_data:
+        ctx.model.add_note(
+            track_name,
+            new_pitch_midi if new_pitch_midi is not None else pitch,
+            new_tick if new_tick is not None else tick,
+            new_dur if new_dur is not None else dur,
+            new_vel if new_vel is not None else vel,
+            new_ch if new_ch is not None else ch,
+        )
+        count += 1
 
-        if "pitch" in op.params:
-            try:
-                new_pitch = parse_pitch(op.params["pitch"])
-            except ValueError as e:
-                return format_result(False, f"Invalid pitch: {e}")
-            old_pitch = note.pitch
-            note.pitch = new_pitch
-            ctx.event_log.append(NoteModified(
-                track_id=note.track_id, note_id=note.id,
-                field_name="pitch", old_value=old_pitch, new_value=new_pitch,
-            ))
-            modified = True
-
-        if "vel" in op.params:
-            try:
-                new_vel = parse_velocity(op.params["vel"])
-            except ValueError as e:
-                return format_result(False, f"Invalid velocity: {e}")
-            old_vel = note.velocity
-            note.velocity = new_vel
-            ctx.event_log.append(NoteModified(
-                track_id=note.track_id, note_id=note.id,
-                field_name="velocity", old_value=old_vel, new_value=new_vel,
-            ))
-            modified = True
-
-        if "dur" in op.params:
-            try:
-                new_dur = parse_duration(op.params["dur"], ctx.song.ppqn)
-            except ValueError as e:
-                return format_result(False, f"Invalid duration: {e}")
-            old_dur = note.duration_ticks
-            note.duration_ticks = new_dur
-            ctx.event_log.append(NoteModified(
-                track_id=note.track_id, note_id=note.id,
-                field_name="duration_ticks", old_value=old_dur, new_value=new_dur,
-            ))
-            modified = True
-
-        if "at" in op.params:
-            try:
-                new_tick = parse_position(
-                    op.params["at"], ctx.song.time_signatures, ctx.song.ppqn,
-                    reference_tick=ctx.last_tick, song_end_tick=max_tick(ctx.song),
-                )
-            except ValueError as e:
-                return format_result(False, f"Invalid position: {e}")
-            old_tick = note.absolute_tick
-            note.absolute_tick = new_tick
-            ctx.event_log.append(NoteModified(
-                track_id=note.track_id, note_id=note.id,
-                field_name="absolute_tick", old_value=old_tick, new_value=new_tick,
-            ))
-            modified = True
-
-        if "ch" in op.params:
-            new_ch = int(op.params["ch"]) - 1
-            old_ch = note.channel
-            note.channel = new_ch
-            ctx.event_log.append(NoteModified(
-                track_id=note.track_id, note_id=note.id,
-                field_name="channel", old_value=old_ch, new_value=new_ch,
-            ))
-            modified = True
-
-        if modified:
-            count += 1
-
-    need_reindex = any(k in op.params for k in ("pitch", "ch"))
-    if need_reindex:
-        ctx.registry.rebuild(ctx.song)
+    ctx.note_index.rebuild(ctx.model)
     return format_result(True, f"Modified {count} note(s)")
 
 
-def op_repeat(op: ParsedOp, ctx: OpContext) -> str:
-    notes = resolve_selectors(op.selectors, ctx.song, ctx.registry, ctx.event_log)
+# ---------------------------------------------------------------------------
+# repeat
+# ---------------------------------------------------------------------------
+
+def op_repeat(op: ParsedOp, ctx: MidiOpContext) -> str:
+    notes = resolve_notes(op.selectors, ctx)
     if isinstance(notes, str):
         return notes
     if not notes:
@@ -300,16 +345,17 @@ def op_repeat(op: ParsedOp, ctx: OpContext) -> str:
     except ValueError:
         return format_result(False, f"Invalid count: {count_str!r}")
 
-    min_tick_val = min(n.absolute_tick for n in notes)
-    max_end = max(n.absolute_tick + n.duration_ticks for n in notes)
+    min_tick_val = min(n.abs_tick for n in notes)
+    max_end = max(n.abs_tick + n.duration_ticks for n in notes)
     span = max_end - min_tick_val
 
     to_str = op.params.get("to")
     if to_str:
+        time_sigs = get_time_sigs(ctx.model)
         try:
             start_tick = parse_position(
-                to_str, ctx.song.time_signatures, ctx.song.ppqn,
-                reference_tick=ctx.last_tick, song_end_tick=max_tick(ctx.song),
+                to_str, time_sigs, ctx.model.ppqn,
+                reference_tick=ctx.last_tick, song_end_tick=max_tick(ctx.model),
             )
         except ValueError as e:
             return format_result(False, f"Invalid position: {e}")
@@ -320,22 +366,24 @@ def op_repeat(op: ParsedOp, ctx: OpContext) -> str:
     added = 0
     for i in range(count):
         current_offset = base_offset + i * span
-        for note in notes:
-            new_tick = note.absolute_tick + current_offset
-            new_note = ctx.song.add_note(
-                note.track_id, note.pitch, new_tick,
-                note.duration_ticks, note.velocity, note.channel,
+        for n in notes:
+            new_tick = n.abs_tick + current_offset
+            ctx.model.add_note(
+                n.track_name, n.pitch, new_tick,
+                n.duration_ticks, n.velocity, n.channel,
             )
-            ctx.event_log.append(NoteAdded(track_id=note.track_id, note_id=new_note.id, note_snapshot=copy.copy(new_note)))
-            track = ctx.song.tracks.get(note.track_id)
-            track_name = track.name if track else ""
-            ctx.registry.add_note(new_note, track_name)
             added += 1
+
+    ctx.note_index.rebuild(ctx.model)
     return format_result(True, f"Repeated {len(notes)} note(s) x{count} ({added} added)")
 
 
-def op_crescendo(op: ParsedOp, ctx: OpContext) -> str:
-    notes = resolve_selectors(op.selectors, ctx.song, ctx.registry, ctx.event_log)
+# ---------------------------------------------------------------------------
+# crescendo / decrescendo
+# ---------------------------------------------------------------------------
+
+def op_crescendo(op: ParsedOp, ctx: MidiOpContext) -> str:
+    notes = resolve_notes(op.selectors, ctx)
     if isinstance(notes, str):
         return notes
     if not notes:
@@ -359,86 +407,30 @@ def op_crescendo(op: ParsedOp, ctx: OpContext) -> str:
     except ValueError as e:
         return format_result(False, f"Invalid to velocity: {e}")
 
-    sorted_notes = sorted(notes, key=lambda n: n.absolute_tick)
+    sorted_notes = sorted(notes, key=lambda n: n.abs_tick)
     n = len(sorted_notes)
 
+    # Collect, remove, re-add with graduated velocity
+    note_data = []
     for i, note in enumerate(sorted_notes):
-        old_vel = note.velocity
         if n == 1:
             new_vel = to_vel
         else:
             new_vel = round(from_vel + (to_vel - from_vel) * i / (n - 1))
         new_vel = max(1, min(127, new_vel))
-        note.velocity = new_vel
-        ctx.event_log.append(NoteModified(
-            track_id=note.track_id, note_id=note.id,
-            field_name="velocity", old_value=old_vel, new_value=new_vel,
-        ))
+        note_data.append(
+            (note.track_name, note.pitch, note.abs_tick,
+             note.duration_ticks, new_vel, note.channel)
+        )
 
+    for note in sorted_notes:
+        ctx.model.remove_note_at(note.track_name, note.pitch, note.abs_tick)
+
+    for track_name, pitch, tick, dur, vel, ch in note_data:
+        ctx.model.add_note(track_name, pitch, tick, dur, vel, ch)
+
+    ctx.note_index.rebuild(ctx.model)
     return format_result(
         True,
         f"{op.verb.capitalize()} applied to {n} note(s) ({from_str} -> {to_str})",
     )
-
-
-def detect_gaps(song: "Song") -> list[str]:  # noqa: F821
-    """Detect empty measures on tracks that have content elsewhere."""
-    from fcp_midi.model.song import Song as _Song  # avoid circular
-
-    if not song.tracks:
-        return []
-
-    tracks_with_notes = [t for t in song.tracks.values() if t.notes]
-    if len(tracks_with_notes) < 2:
-        return []
-
-    ts = song.time_signatures[0] if song.time_signatures else None
-    num = ts.numerator if ts else 4
-    denom = ts.denominator if ts else 4
-    tpm = _ticks_per_measure(num, denom, song.ppqn)
-    if tpm == 0:
-        return []
-
-    max_tick_val = 0
-    for track in tracks_with_notes:
-        for note in track.notes.values():
-            end = note.absolute_tick + note.duration_ticks
-            if end > max_tick_val:
-                max_tick_val = end
-
-    total_measures = (max_tick_val + tpm - 1) // tpm
-    if total_measures <= 0:
-        return []
-
-    global_occupied: set[int] = set()
-    track_occupied: dict[str, set[int]] = {}
-
-    for track in tracks_with_notes:
-        occupied: set[int] = set()
-        for note in track.notes.values():
-            measure = note.absolute_tick // tpm + 1
-            occupied.add(measure)
-        track_occupied[track.name] = occupied
-        global_occupied |= occupied
-
-    warnings: list[str] = []
-    for track in tracks_with_notes:
-        missing = sorted(global_occupied - track_occupied[track.name])
-        if not missing:
-            continue
-        ranges: list[str] = []
-        start = missing[0]
-        end = missing[0]
-        for m in missing[1:]:
-            if m == end + 1:
-                end = m
-            else:
-                ranges.append(f"{start}-{end}" if start != end else str(start))
-                start = m
-                end = m
-        ranges.append(f"{start}-{end}" if start != end else str(start))
-
-        for r in ranges:
-            warnings.append(f"? {track.name}: empty at measure {r}")
-
-    return warnings

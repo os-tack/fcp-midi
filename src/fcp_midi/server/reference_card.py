@@ -66,8 +66,6 @@ _EXTRA_SECTIONS: dict[str, str] = {
   tracker TRACK M.B-M.B [res:RES]  Tracker step view (single track)
   tracker Track1,Track2 M.B-M.B [res:RES]  Multi-track combined view (read-only)
   tracker * M.B-M.B [res:RES]     All tracks combined view (read-only)
-  history N          Recent N events from log
-  diff checkpoint:NAME  Events since checkpoint
   instruments [FILTER] List available instruments""",
     "SESSION ACTIONS": """\
   new "Title" [tempo:N] [time-sig:N/D] [key:K] [ppqn:N]
@@ -76,8 +74,7 @@ _EXTRA_SECTIONS: dict[str, str] = {
   save as:./path.mid
   checkpoint NAME
   undo [to:NAME]
-  redo
-  load-soundfont PATH""",
+  redo""",
     "GM INSTRUMENTS (EXAMPLES)": """\
   acoustic-grand-piano, electric-piano-1, vibraphone
   acoustic-guitar-nylon, electric-bass-finger, violin
@@ -86,7 +83,6 @@ _EXTRA_SECTIONS: dict[str, str] = {
   program:N           Raw MIDI program number (0-127)
   bank:MSB            Bank select (MSB only)
   bank:MSB.LSB        Bank select (MSB and LSB)
-  load-soundfont PATH Load presets from .sf2 file
   instruments [FILTER] Query available instruments""",
     "EXAMPLE WORKFLOW": """\
   1. midi_session('new "My Song" tempo:120 time-sig:4/4 key:C-major')
@@ -131,97 +127,6 @@ def _build_reference_card() -> str:
     # Remove trailing empty lines
     while lines and lines[-1] == "":
         lines.pop()
-
-    return "\n".join(lines)
-
-
-def build_tool_description() -> str:
-    """Build the inline tool description for the `midi` tool.
-
-    Embeds the full reference card directly in the tool description so the
-    LLM sees the complete command set on connect — no extra call needed.
-    Follows the same pattern as fcp-drawio's `drawio` tool.
-    """
-    lines: list[str] = []
-    lines.append(
-        "Execute MIDI operations. Each op string follows: VERB TARGET [key:value ...]\n"
-        "Call midi_help for the full reference card.\n"
-    )
-    lines.append("MIDI FCP — COMMAND REFERENCE\n")
-
-    # Verb syntax by category (using registry)
-    categories = {
-        "music": "NOTES, CHORDS & TRACKS",
-        "meta": "TEMPO, TIME & KEY",
-        "editing": "EDITING (selector-based)",
-        "state": "TRACK STATE",
-    }
-    for cat_key, cat_title in categories.items():
-        cat_verbs = [v for v in _registry.verbs if v.category == cat_key]
-        if not cat_verbs:
-            continue
-        lines.append(f"{cat_title}:")
-        for v in cat_verbs:
-            lines.append(f"  {v.syntax}")
-        lines.append("")
-
-    # Inline reference sections (compact)
-    lines.append(
-        "SELECTORS:\n"
-        "  @track:NAME  @channel:N  @range:M.B-M.B  @pitch:PITCH\n"
-        "  @velocity:N-M  @all  @recent  @recent:N  @not:TYPE:VALUE\n"
-        "  Combine to intersect: @track:Piano @range:1.1-4.4\n"
-    )
-    lines.append(
-        "POSITION:\n"
-        "  M.B (1.1 = start)  M.B.T (tick offset)  tick:N  +DUR  -DUR  end\n"
-    )
-    lines.append(
-        "DURATION:\n"
-        "  whole, half, quarter, eighth, sixteenth, 32nd\n"
-        "  1n, 2n, 4n, 8n, 16n, 32n\n"
-        "  dotted-quarter, triplet-eighth, ticks:N\n"
-    )
-    lines.append(
-        "PITCH:\n"
-        "  C4, D#5, Bb3 (note+accidental+octave)  midi:60 (raw MIDI number)\n"
-    )
-    lines.append(
-        "CHORDS:\n"
-        "  Cmaj, Am, Dm7, G7, Bdim, Faug, Csus4, Asus2\n"
-        "  Cmaj7, Am7, Dm7b5, G9, Cm6, Cadd9, Dm/F (slash)\n"
-    )
-    lines.append(
-        "VELOCITY:\n"
-        "  0-127 (numeric)  ppp, pp, p, mp, mf, f, ff, fff (dynamic names)\n"
-    )
-    lines.append(
-        "CC NAMES:\n"
-        "  volume, pan, modulation, expression, sustain,\n"
-        "  reverb, chorus, brightness, portamento, breath\n"
-    )
-    lines.append(
-        "GM INSTRUMENTS (examples):\n"
-        "  acoustic-grand-piano, electric-piano-1, vibraphone\n"
-        "  acoustic-guitar-nylon, electric-bass-finger, violin\n"
-        "  trumpet, alto-sax, flute, string-ensemble-1\n"
-        "  program:N (raw 0-127)  bank:MSB[.LSB]\n"
-    )
-    lines.append(
-        "RESPONSE PREFIXES:\n"
-        "  +  note/chord added     ~  event modified\n"
-        "  *  track modified       -  event removed\n"
-        "  !  meta event           @  bulk operation\n"
-    )
-    lines.append(
-        "CONVENTIONS:\n"
-        "  - Positions are 1-based: measure 1, beat 1 = 1.1\n"
-        "  - Channels are 1-indexed user-facing (ch:1 through ch:16)\n"
-        "  - Channel 10 is drums (GM standard)\n"
-        "  - Track names are unique identifiers — no ID management needed\n"
-        "  - Batch multiple ops in one call for efficiency\n"
-        "  - Call midi_help after context truncation for full reference"
-    )
 
     return "\n".join(lines)
 

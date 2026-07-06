@@ -143,6 +143,35 @@ def remove_message_at_index(track: mido.MidiTrack, index: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Key signature parsing
+# ---------------------------------------------------------------------------
+
+def parse_key_signature(ks_str: str) -> tuple[str, str]:
+    """Split a DSL key string ("C-major", "G-minor", "Dm", "F#") into
+    (key, mode). ``mode`` is "major" or "minor"."""
+    parts = ks_str.replace("-", " ").split()
+    key = parts[0] if parts else "C"
+    mode = parts[1] if len(parts) > 1 else "major"
+
+    # Handle shorthand: "Dm" -> key="D", mode="minor"
+    if len(parts) == 1 and mode == "major":
+        if len(key) >= 2 and key.endswith("m") and key[-2] not in ("#", "b"):
+            mode = "minor"
+            key = key[:-1]
+        elif len(key) >= 3 and key.endswith("m") and key[-2] in ("#", "b"):
+            mode = "minor"
+            key = key[:-1]
+
+    return key, mode
+
+
+def to_mido_key(key: str, mode: str) -> str:
+    """Convert (key, mode) into mido's compact key_signature format
+    ("C", "Am", "F#", "Bbm")."""
+    return key + "m" if mode == "minor" else key
+
+
+# ---------------------------------------------------------------------------
 # Track metadata extraction
 # ---------------------------------------------------------------------------
 
@@ -296,8 +325,9 @@ class MidiModel:
             )
         )
         if key:
+            mido_key = to_mido_key(*parse_key_signature(key))
             conductor.append(
-                mido.MetaMessage("key_signature", key=key, time=0)
+                mido.MetaMessage("key_signature", key=mido_key, time=0)
             )
         conductor.append(mido.MetaMessage("end_of_track", time=0))
         self.file.tracks.append(conductor)

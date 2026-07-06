@@ -1,41 +1,78 @@
-"""Op handlers for music creation: note, chord, track, cc, bend, mute, solo, program."""
+"""Op handlers for music creation: note, chord, track, cc, bend, mute, solo, program.
+
+These operate directly on MidiModel via mido messages,
+replacing the Song-based event-sourcing approach.
+"""
 
 from __future__ import annotations
 
-import copy
-import re
+import mido
 
-from fcp_midi.model.event_log import (
-    CCAdded,
-    NoteAdded,
-    PitchBendAdded,
-    TrackAdded,
-    TrackRemoved,
+from fcp_midi.lib.cc_names import parse_cc_value
+from fcp_midi.model.midi_model import (
+    MidiModel,
+    insert_message_at_tick,
 )
 from fcp_midi.model.timing import ticks_to_position
 from fcp_midi.parser.chord import parse_chord
+from fcp_midi.parser.duration import parse_duration
 from fcp_midi.parser.ops import ParsedOp
 from fcp_midi.parser.pitch import parse_pitch
-from fcp_midi.lib.cc_names import parse_cc_value
+from fcp_midi.parser.position import parse_position
 from fcp_midi.server.formatter import format_result
-from fcp_midi.server.resolvers import (
-    OpContext,
-    resolve_bank,
-    resolve_channel,
-    resolve_duration,
-    resolve_instrument,
-    resolve_position,
-    resolve_track,
-    resolve_velocity,
+from fcp_midi.server.ops_context import (
+    MidiOpContext,
     display_channel,
+    get_time_sigs,
     max_tick,
+    resolve_track,
+)
+from fcp_midi.server.resolvers import (
+    resolve_bank,
+    resolve_instrument,
+    resolve_velocity,
 )
 
 
-def op_note(op: ParsedOp, ctx: OpContext) -> str:
-    track = resolve_track(ctx.song, op.target)
-    if isinstance(track, str):
-        return track
+def _resolve_channel(params: dict[str, str]) -> int | None:
+    """Parse ``ch`` param (1-indexed) to 0-indexed, or None if absent."""
+    if "ch" in params:
+        return int(params["ch"]) - 1
+    return None
+
+
+def _resolve_position(params: dict[str, str], ctx: MidiOpContext,
+                       key: str = "at", default: str = "1.1") -> int | str:
+    """Parse a position param, returning tick or error string."""
+    at_str = params.get(key, default)
+    time_sigs = get_time_sigs(ctx.model)
+    try:
+        return parse_position(
+            at_str, time_sigs, ctx.model.ppqn,
+            reference_tick=ctx.last_tick, song_end_tick=max_tick(ctx.model),
+        )
+    except ValueError as e:
+        return format_result(False, f"Invalid position: {e}")
+
+
+def _resolve_duration(params: dict[str, str], ppqn: int,
+                       key: str = "dur", default: str = "quarter") -> int | str:
+    """Parse a duration param, returning ticks or error string."""
+    dur_str = params.get(key, default)
+    try:
+        return parse_duration(dur_str, ppqn)
+    except ValueError as e:
+        return format_result(False, f"Invalid duration: {e}")
+
+
+# ---------------------------------------------------------------------------
+# note
+# ---------------------------------------------------------------------------
+
+def op_note(op: ParsedOp, ctx: MidiOpContext) -> str:
+    ref = resolve_track(ctx.model, op.target)
+    if isinstance(ref, str):
+        return ref
 
     pitch_str = op.params.get("pitch")
     if not pitch_str and "midi" in op.params:
@@ -48,11 +85,11 @@ def op_note(op: ParsedOp, ctx: OpContext) -> str:
     except ValueError as e:
         return format_result(False, f"Invalid pitch: {e}")
 
-    tick = resolve_position(op.params, ctx.song, ctx.last_tick)
+    tick = _resolve_position(op.params, ctx)
     if isinstance(tick, str):
         return tick
 
-    dur = resolve_duration(op.params, ctx.song)
+    dur = _resolve_duration(op.params, ctx.model.ppqn)
     if isinstance(dur, str):
         return dur
 
@@ -60,25 +97,31 @@ def op_note(op: ParsedOp, ctx: OpContext) -> str:
     if isinstance(vel, str):
         return vel
 
-    ch = resolve_channel(op.params)
+    ch = _resolve_channel(op.params)
 
-    note = ctx.song.add_note(track.id, pitch, tick, dur, vel, ch)
-    ctx.event_log.append(NoteAdded(track_id=track.id, note_id=note.id, note_snapshot=copy.copy(note)))
-    ctx.registry.add_note(note, track.name)
+    note_ref = ctx.model.add_note(
+        ref.name, pitch.midi_number, tick, dur, vel,
+        channel=ch if ch is not None else None,
+    )
     ctx.last_tick = tick + dur
 
     dur_str = op.params.get("dur", "quarter")
-    pos = ticks_to_position(tick, ctx.song.time_signatures, ctx.song.ppqn)
+    time_sigs = get_time_sigs(ctx.model)
+    pos = ticks_to_position(tick, time_sigs, ctx.model.ppqn)
     return format_result(
         True,
-        f"Note {pitch_str} at {pos} on {track.name} (vel:{vel} dur:{dur_str})"
+        f"Note {pitch_str} at {pos} on {ref.name} (vel:{vel} dur:{dur_str})"
     )
 
 
-def op_chord(op: ParsedOp, ctx: OpContext) -> str:
-    track = resolve_track(ctx.song, op.target)
-    if isinstance(track, str):
-        return track
+# ---------------------------------------------------------------------------
+# chord
+# ---------------------------------------------------------------------------
+
+def op_chord(op: ParsedOp, ctx: MidiOpContext) -> str:
+    ref = resolve_track(ctx.model, op.target)
+    if isinstance(ref, str):
+        return ref
 
     chord_str = op.params.get("chord")
     if not chord_str:
@@ -89,11 +132,11 @@ def op_chord(op: ParsedOp, ctx: OpContext) -> str:
     except ValueError as e:
         return format_result(False, f"Invalid chord: {e}")
 
-    tick = resolve_position(op.params, ctx.song, ctx.last_tick)
+    tick = _resolve_position(op.params, ctx)
     if isinstance(tick, str):
         return tick
 
-    dur = resolve_duration(op.params, ctx.song)
+    dur = _resolve_duration(op.params, ctx.model.ppqn)
     if isinstance(dur, str):
         return dur
 
@@ -101,23 +144,29 @@ def op_chord(op: ParsedOp, ctx: OpContext) -> str:
     if isinstance(vel, str):
         return vel
 
-    ch = resolve_channel(op.params)
+    ch = _resolve_channel(op.params)
 
     for pitch in pitches:
-        note = ctx.song.add_note(track.id, pitch, tick, dur, vel, ch)
-        ctx.event_log.append(NoteAdded(track_id=track.id, note_id=note.id, note_snapshot=copy.copy(note)))
-        ctx.registry.add_note(note, track.name)
+        ctx.model.add_note(
+            ref.name, pitch.midi_number, tick, dur, vel,
+            channel=ch if ch is not None else None,
+        )
 
     ctx.last_tick = tick + dur
 
-    pos = ticks_to_position(tick, ctx.song.time_signatures, ctx.song.ppqn)
+    time_sigs = get_time_sigs(ctx.model)
+    pos = ticks_to_position(tick, time_sigs, ctx.model.ppqn)
     return format_result(
         True,
-        f"Chord {chord_str} ({len(pitches)} notes) at {pos} on {track.name}"
+        f"Chord {chord_str} ({len(pitches)} notes) at {pos} on {ref.name}"
     )
 
 
-def op_track(op: ParsedOp, ctx: OpContext) -> str:
+# ---------------------------------------------------------------------------
+# track
+# ---------------------------------------------------------------------------
+
+def op_track(op: ParsedOp, ctx: MidiOpContext) -> str:
     sub = op.target  # "add" or "remove"
 
     if sub == "add":
@@ -140,28 +189,29 @@ def op_track(op: ParsedOp, ctx: OpContext) -> str:
         program = resolved.program
         inst_name = resolved.instrument_name
         is_drum_kit = resolved.is_drum_kit
-        bank_msb = resolved.bank_msb
-        bank_lsb = resolved.bank_lsb
 
         if is_drum_kit and program is None:
             program = 0
 
-        ch = resolve_channel(op.params)
+        ch = _resolve_channel(op.params)
         if is_drum_kit and ch is None:
             ch = 9
 
-        track = ctx.song.add_track(
-            name=name,
-            instrument=inst_name,
-            program=program,
-            channel=ch,
-        )
-        track.bank_msb = bank_msb
-        track.bank_lsb = bank_lsb
-        ctx.event_log.append(TrackAdded(track_id=track.id, track_snapshot=copy.copy(track)))
+        try:
+            ctx.model.add_track(
+                name=name,
+                channel=ch,
+                instrument=inst_name,
+                program=program,
+                bank_msb=resolved.bank_msb or 0,
+                bank_lsb=resolved.bank_lsb or 0,
+            )
+        except ValueError as e:
+            return format_result(False, str(e))
 
+        track_ref = ctx.model.get_track(name)
         inst_display = inst_name or "no instrument"
-        disp_ch = display_channel(track.channel)
+        disp_ch = display_channel(track_ref.channel)
         return format_result(True, f"Track '{name}' added (ch:{disp_ch}, {inst_display})")
 
     elif sub == "remove":
@@ -169,16 +219,15 @@ def op_track(op: ParsedOp, ctx: OpContext) -> str:
         if not name:
             return format_result(False, "Missing track name for remove")
 
-        track = ctx.song.get_track_by_name(name)
-        if not track:
-            from fcp_midi.server.resolvers import suggest_track_name
-            suggestion = suggest_track_name(ctx.song, name)
+        ref = ctx.model.get_track(name)
+        if not ref:
+            from fcp_midi.server.ops_context import suggest_track_name
+            suggestion = suggest_track_name(ctx.model, name)
             return format_result(False, f"Track '{name}' not found", suggestion)
 
-        removed = ctx.song.remove_track(track.id)
+        removed = ctx.model.remove_track(name)
         if removed:
-            ctx.event_log.append(TrackRemoved(track_id=removed.id, track_snapshot=removed))
-            ctx.registry.rebuild(ctx.song)
+            ctx.note_index.rebuild(ctx.model)
             return format_result(True, f"Track '{name}' removed")
         return format_result(False, f"Failed to remove track '{name}'")
 
@@ -187,10 +236,14 @@ def op_track(op: ParsedOp, ctx: OpContext) -> str:
                              "track add NAME or track remove NAME")
 
 
-def op_cc(op: ParsedOp, ctx: OpContext) -> str:
-    track = resolve_track(ctx.song, op.target)
-    if isinstance(track, str):
-        return track
+# ---------------------------------------------------------------------------
+# cc
+# ---------------------------------------------------------------------------
+
+def op_cc(op: ParsedOp, ctx: MidiOpContext) -> str:
+    ref = resolve_track(ctx.model, op.target)
+    if isinstance(ref, str):
+        return ref
 
     cc_name = op.params.get("cc_name")
     cc_value_str = op.params.get("cc_value")
@@ -203,26 +256,34 @@ def op_cc(op: ParsedOp, ctx: OpContext) -> str:
     except ValueError as e:
         return format_result(False, str(e))
 
-    from fcp_midi.parser.position import parse_position as _parse_pos
+    time_sigs = get_time_sigs(ctx.model)
     at_str = op.params.get("at", "1.1")
     try:
-        tick = _parse_pos(at_str, ctx.song.time_signatures, ctx.song.ppqn)
+        tick = parse_position(at_str, time_sigs, ctx.model.ppqn)
     except ValueError as e:
         return format_result(False, f"Invalid position: {e}")
 
-    ch = resolve_channel(op.params)
+    ch = _resolve_channel(op.params)
+    channel = ch if ch is not None else ref.channel
 
-    cc = ctx.song.add_cc(track.id, cc_num, cc_val, tick, ch)
-    ctx.event_log.append(CCAdded(track_id=track.id, cc_id=cc.id, cc_snapshot=copy.copy(cc)))
+    insert_message_at_tick(
+        ref.track,
+        mido.Message("control_change", channel=channel, control=cc_num, value=cc_val),
+        tick,
+    )
 
-    pos = ticks_to_position(tick, ctx.song.time_signatures, ctx.song.ppqn)
-    return format_result(True, f"CC {cc_name}={cc_val} at {pos} on {track.name}")
+    pos = ticks_to_position(tick, time_sigs, ctx.model.ppqn)
+    return format_result(True, f"CC {cc_name}={cc_val} at {pos} on {ref.name}")
 
 
-def op_bend(op: ParsedOp, ctx: OpContext) -> str:
-    track = resolve_track(ctx.song, op.target)
-    if isinstance(track, str):
-        return track
+# ---------------------------------------------------------------------------
+# bend
+# ---------------------------------------------------------------------------
+
+def op_bend(op: ParsedOp, ctx: MidiOpContext) -> str:
+    ref = resolve_track(ctx.model, op.target)
+    if isinstance(ref, str):
+        return ref
 
     value_str = op.params.get("value", "0")
     if value_str.lower() == "center":
@@ -236,46 +297,58 @@ def op_bend(op: ParsedOp, ctx: OpContext) -> str:
     if value < -8192 or value > 8191:
         return format_result(False, f"Bend value out of range (-8192 to 8191): {value}")
 
-    from fcp_midi.parser.position import parse_position as _parse_pos
+    time_sigs = get_time_sigs(ctx.model)
     at_str = op.params.get("at", "1.1")
     try:
-        tick = _parse_pos(at_str, ctx.song.time_signatures, ctx.song.ppqn)
+        tick = parse_position(at_str, time_sigs, ctx.model.ppqn)
     except ValueError as e:
         return format_result(False, f"Invalid position: {e}")
 
-    ch = resolve_channel(op.params)
+    ch = _resolve_channel(op.params)
+    channel = ch if ch is not None else ref.channel
 
-    pb = ctx.song.add_pitch_bend(track.id, value, tick, ch)
-    ctx.event_log.append(PitchBendAdded(track_id=track.id, pb_id=pb.id, pb_snapshot=copy.copy(pb)))
+    insert_message_at_tick(
+        ref.track,
+        mido.Message("pitchwheel", channel=channel, pitch=value),
+        tick,
+    )
 
-    pos = ticks_to_position(tick, ctx.song.time_signatures, ctx.song.ppqn)
-    return format_result(True, f"Pitch bend={value} at {pos} on {track.name}")
-
-
-def op_mute(op: ParsedOp, ctx: OpContext) -> str:
-    track = resolve_track(ctx.song, op.target)
-    if isinstance(track, str):
-        return track
-
-    track.mute = not track.mute
-    state = "muted" if track.mute else "unmuted"
-    return format_result(True, f"Track '{track.name}' {state}")
+    pos = ticks_to_position(tick, time_sigs, ctx.model.ppqn)
+    return format_result(True, f"Pitch bend={value} at {pos} on {ref.name}")
 
 
-def op_solo(op: ParsedOp, ctx: OpContext) -> str:
-    track = resolve_track(ctx.song, op.target)
-    if isinstance(track, str):
-        return track
+# ---------------------------------------------------------------------------
+# mute / solo
+# ---------------------------------------------------------------------------
 
-    track.solo = not track.solo
-    state = "solo on" if track.solo else "solo off"
-    return format_result(True, f"Track '{track.name}' {state}")
+def op_mute(op: ParsedOp, ctx: MidiOpContext) -> str:
+    ref = resolve_track(ctx.model, op.target)
+    if isinstance(ref, str):
+        return ref
+
+    ref.mute = not ref.mute
+    state = "muted" if ref.mute else "unmuted"
+    return format_result(True, f"Track '{ref.name}' {state}")
 
 
-def op_program(op: ParsedOp, ctx: OpContext) -> str:
-    track = resolve_track(ctx.song, op.target)
-    if isinstance(track, str):
-        return track
+def op_solo(op: ParsedOp, ctx: MidiOpContext) -> str:
+    ref = resolve_track(ctx.model, op.target)
+    if isinstance(ref, str):
+        return ref
+
+    ref.solo = not ref.solo
+    state = "solo on" if ref.solo else "solo off"
+    return format_result(True, f"Track '{ref.name}' {state}")
+
+
+# ---------------------------------------------------------------------------
+# program
+# ---------------------------------------------------------------------------
+
+def op_program(op: ParsedOp, ctx: MidiOpContext) -> str:
+    ref = resolve_track(ctx.model, op.target)
+    if isinstance(ref, str):
+        return ref
 
     bank = resolve_bank(op.params)
     if isinstance(bank, str):
@@ -291,10 +364,23 @@ def op_program(op: ParsedOp, ctx: OpContext) -> str:
     if resolved.program is None and resolved.instrument_name is None:
         return format_result(False, "Missing instrument name or program number")
 
-    track.instrument = resolved.instrument_name
-    track.program = resolved.program
+    # Find and replace the existing program_change message in the track
+    new_program = resolved.program if resolved.program is not None else 0
+    for i, msg in enumerate(ref.track):
+        if msg.type == "program_change":
+            ref.track[i] = mido.Message(
+                "program_change", channel=ref.channel,
+                program=new_program, time=msg.time,
+            )
+            break
+
+    ref.program = new_program
     if resolved.bank_msb is not None:
-        track.bank_msb = resolved.bank_msb
+        ref.bank_msb = resolved.bank_msb
     if resolved.bank_lsb is not None:
-        track.bank_lsb = resolved.bank_lsb
-    return format_result(True, f"Track '{track.name}' instrument set to {resolved.instrument_name} (program:{resolved.program})")
+        ref.bank_lsb = resolved.bank_lsb
+
+    return format_result(
+        True,
+        f"Track '{ref.name}' instrument set to {resolved.instrument_name} (program:{new_program})"
+    )

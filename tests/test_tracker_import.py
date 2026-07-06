@@ -1,4 +1,4 @@
-"""Tests for tracker block-mode import via MidiAdapterV2."""
+"""Tests for tracker block-mode import via MidiAdapter."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import pytest
 
 from fcp_core import EventLog as CoreEventLog, ParsedOp as GenericParsedOp, parse_op
 
-from fcp_midi.adapter_v2 import MidiAdapterV2, SnapshotEvent
+from fcp_midi.adapter import MidiAdapter, SnapshotEvent
 from fcp_midi.model.midi_model import MidiModel, pair_notes
 
 
@@ -15,23 +15,23 @@ from fcp_midi.model.midi_model import MidiModel, pair_notes
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def adapter() -> MidiAdapterV2:
-    return MidiAdapterV2()
+def adapter() -> MidiAdapter:
+    return MidiAdapter()
 
 
 @pytest.fixture
-def model(adapter: MidiAdapterV2) -> MidiModel:
+def model(adapter: MidiAdapter) -> MidiModel:
     return adapter.create_empty("Test Song", {"tempo": "120", "time-sig": "4/4"})
 
 
 @pytest.fixture
-def model_with_piano(adapter: MidiAdapterV2, model: MidiModel) -> MidiModel:
+def model_with_piano(adapter: MidiAdapter, model: MidiModel) -> MidiModel:
     log = CoreEventLog()
     _dispatch(adapter, model, log, "track add Piano instrument:acoustic-grand-piano")
     return model
 
 
-def _dispatch(adapter: MidiAdapterV2, model: MidiModel, log: CoreEventLog, raw: str):
+def _dispatch(adapter: MidiAdapter, model: MidiModel, log: CoreEventLog, raw: str):
     op = parse_op(raw)
     return adapter.dispatch_op(op, model, log)
 

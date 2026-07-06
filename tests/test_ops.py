@@ -1,4 +1,4 @@
-"""Tests for v2 op handlers — mido-native MidiModel operations."""
+"""Tests for op handlers — mido-native MidiModel operations."""
 
 from __future__ import annotations
 
@@ -15,15 +15,15 @@ from fcp_midi.model.midi_model import (
     pair_notes,
 )
 from fcp_midi.parser.ops import parse_op
-from fcp_midi.server.ops_context_v2 import MidiOpContext, get_time_sigs
-from fcp_midi.server.ops_meta_v2 import (
+from fcp_midi.server.ops_context import MidiOpContext, get_time_sigs
+from fcp_midi.server.ops_meta import (
     op_key_sig,
     op_marker,
     op_tempo,
     op_time_sig,
     op_title,
 )
-from fcp_midi.server.ops_music_v2 import (
+from fcp_midi.server.ops_music import (
     op_bend,
     op_cc,
     op_chord,
@@ -33,7 +33,7 @@ from fcp_midi.server.ops_music_v2 import (
     op_solo,
     op_track,
 )
-from fcp_midi.server.ops_editing_v2 import (
+from fcp_midi.server.ops_editing import (
     op_copy,
     op_crescendo,
     op_modify,
@@ -58,7 +58,7 @@ def _make_ctx_with_track(track_name="Piano", program=0, **kwargs) -> MidiOpConte
 
 
 # ===========================================================================
-# ops_meta_v2
+# ops_meta
 # ===========================================================================
 
 class TestOpTempo:
@@ -168,7 +168,7 @@ class TestOpTitle:
 
 
 # ===========================================================================
-# ops_music_v2
+# ops_music
 # ===========================================================================
 
 class TestOpNote:
@@ -312,7 +312,7 @@ class TestOpProgram:
 
 
 # ===========================================================================
-# ops_editing_v2
+# ops_editing
 # ===========================================================================
 
 class TestOpRemove:
